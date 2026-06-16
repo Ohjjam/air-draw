@@ -17,6 +17,8 @@
     font-size:14px; font-weight:600; display:flex; align-items:center; gap:8px; transition:.2s; white-space:nowrap; }
   #status .dot { width:10px; height:10px; border-radius:50%; background:#777; transition:.15s; }
   #status.drawing .dot { background:#37e06b; box-shadow:0 0 12px #37e06b; }
+  #hud { position:fixed; top:max(10px,env(safe-area-inset-top)); left:10px; z-index:30; font:12px/1.5 ui-monospace,monospace;
+    color:#9fe6b0; background:rgba(0,0,0,.55); padding:6px 9px; border-radius:8px; white-space:pre; pointer-events:none; }
 
   /* 툴바 */
   #toolbar { position:fixed; bottom:max(16px,env(safe-area-inset-bottom)); left:50%; transform:translateX(-50%); z-index:20;
@@ -50,6 +52,7 @@
   <canvas id="view"></canvas>
 
   <div id="status"><span class="dot"></span><span id="statusText">시작을 눌러주세요</span></div>
+  <div id="hud"></div>
 
   <div id="toolbar">
     <div id="swatches"></div>
@@ -82,6 +85,8 @@ const statusText = document.getElementById('statusText');
 const loadingEl = document.getElementById('loading');
 const errEl  = document.getElementById('err');
 const spin   = document.getElementById('spin');
+const hudEl  = document.getElementById('hud');
+const hud = { v:'v2', delegate:'-', cam:'-', hands:0, fps:0, err:'' };
 
 let dpr = Math.min(window.devicePixelRatio || 1, 2);
 
@@ -123,7 +128,7 @@ document.getElementById('flipCam').onclick = async () => {
 };
 
 /* ---------- 손 추적 ---------- */
-let handLandmarker, video, running=false, lastVideoTime=-1;
+let handLandmarker, video, running=false;
 let smooth=null, lastPoint=null, cursor=null;
 
 document.getElementById('startBtn').onclick = init;
@@ -135,14 +140,16 @@ async function init(){
   spin.style.display='block';
   try {
     const fileset = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
-    handLandmarker = await HandLandmarker.createFromOptions(fileset, {
+    const makeOpts = (delegate) => ({
       baseOptions: {
         modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
-        delegate: "GPU"
+        delegate
       },
-      runningMode: "VIDEO",
-      numHands: 1
+      runningMode: "VIDEO", numHands: 1,
+      minHandDetectionConfidence: 0.4, minHandPresenceConfidence: 0.4, minTrackingConfidence: 0.4
     });
+    try { handLandmarker = await HandLandmarker.createFromOptions(fileset, makeOpts("GPU")); hud.delegate = 'GPU'; }
+    catch (e) { console.warn('GPU delegate 실패 → CPU 폴백', e); handLandmarker = await HandLandmarker.createFromOptions(fileset, makeOpts("CPU")); hud.delegate = 'CPU'; }
     await startCamera();
     resize();
     loadingEl.style.display='none';
@@ -156,23 +163,43 @@ async function startCamera(){
   const stream = await navigator.mediaDevices.getUserMedia({
     video: { facingMode: facing, width:{ideal:1280}, height:{ideal:720} }, audio:false
   });
-  if (!video){ video = document.createElement('video'); video.playsInline = true; video.muted = true; }
+  if (!video){
+    video = document.createElement('video');
+    video.playsInline = true; video.muted = true; video.autoplay = true;
+    video.setAttribute('playsinline',''); video.setAttribute('muted','');
+    video.style.cssText = 'position:fixed;top:0;left:0;width:1px;height:1px;opacity:.01;pointer-events:none;z-index:-1;';
+    document.body.appendChild(video);   // iOS는 DOM에 붙어야 프레임이 흐름
+  }
   video.srcObject = stream;
   await video.play();
+  await new Promise(res => {
+    if (video.readyState >= 2 && video.videoWidth) return res();
+    video.onloadeddata = res; setTimeout(res, 1500);
+  });
 }
 
 // 손가락이 펴졌는지: 끝마디가 중간마디보다 위에 있으면 펴진 것
 const up = (lm, tip, pip) => lm[tip].y < lm[pip].y;
 
+let lastTs=-1, fpsT=0, fpsN=0;
 function loop(){
   if (!running) return;
-  if (video.readyState >= 2 && video.videoWidth) {
-    if (video.currentTime !== lastVideoTime) {
-      lastVideoTime = video.currentTime;
-      handleResult(handLandmarker.detectForVideo(video, performance.now()));
-    }
+  const now = performance.now();
+  if (video && video.readyState >= 2 && video.videoWidth){
+    const ts = now <= lastTs ? lastTs+1 : now; lastTs = ts;
+    try {
+      const res = handLandmarker.detectForVideo(video, ts);
+      handleResult(res);
+      hud.hands = (res && res.landmarks) ? res.landmarks.length : 0;
+      hud.err = '';
+    } catch(e){ hud.err = (e && e.message) || String(e); }
+    hud.cam = video.videoWidth + 'x' + video.videoHeight;
+  } else {
+    hud.cam = 'no frame';
   }
+  fpsN++; if (now - fpsT > 500){ hud.fps = Math.round(fpsN*1000/(now-fpsT)); fpsN=0; fpsT=now; }
   render();
+  updateHud();
   requestAnimationFrame(loop);
 }
 
@@ -232,6 +259,11 @@ function render(){
 }
 
 function setStatus(t, d){ statusText.textContent = t; statusEl.classList.toggle('drawing', !!d); }
+
+function updateHud(){
+  hudEl.textContent = `air-draw ${hud.v} · ${hud.delegate}\ncam ${hud.cam} · hands ${hud.hands} · ${hud.fps}fps`
+    + (hud.err ? `\n⚠ ${hud.err}` : '');
+}
 
 function showErr(e){
   spin.style.display='none'; errEl.style.display='block';
